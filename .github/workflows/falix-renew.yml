@@ -175,7 +175,9 @@ jobs:
 
       - name: 续期
         env:
-          FALIX_COOKIE: ${{ secrets.FALIX_COOKIE }}
+          FALIX_EMAIL: ${{ secrets.FALIX_EMAIL }}
+          FALIX_PASSWORD: ${{ secrets.FALIX_PASSWORD }}
+          FALIX_COOKIE: ${{ secrets.FALIX_COOKIE }}   # 可选：有就先试 Cookie，失效自动账号密码登录
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
@@ -188,7 +190,9 @@ jobs:
 
           BASE = "https://client.falixnodes.net"
           IDS = [s.strip() for s in os.environ.get("FALIX_SERVER_ID", "").split(",") if s.strip()]
-          COOKIE = os.environ.get("FALIX_COOKIE", "")
+          COOKIE = os.environ.get("FALIX_COOKIE", "")      # 可选
+          EMAIL = os.environ.get("FALIX_EMAIL", "")
+          PASSWORD = os.environ.get("FALIX_PASSWORD", "")
           IS_PROXY = os.environ.get("IS_PROXY", "false") == "true"
           PROXY = os.environ.get("PROXY_URL", "socks5://127.0.0.1:1080")
           PROXY_NOTE = os.environ.get("PROXY_NOTE", "")
@@ -303,12 +307,70 @@ jobs:
               return js(sb, """(()=>[...document.querySelectorAll('[role=alert],[role=status],.toast,[class*=toast],[class*=Toast],[class*=notif],[class*=alert]')]
                   .map(e=>e.innerText.trim()).filter(t=>t && t.length<200).join(' | '))()""") or ""
 
-          def open_timer(sb, url):
+          def on_login(sb):
+              cur = sb.cdp.get_current_url()
+              return "/auth/" in cur or "/login" in cur
+
+          def first_sel(sb, sels, timeout=15):
+              end = time.time() + timeout
+              while time.time() < end:
+                  for s_ in sels:
+                      if sb.cdp.is_element_visible(s_):
+                          return s_
+                  time.sleep(0.5)
+              return None
+
+          def login(sb, nxt):
+              """账号密码登录（含 CF 验证）"""
+              if not (EMAIL and PASSWORD):
+                  raise RuntimeError("需要登录，但没有配置 FALIX_EMAIL / FALIX_PASSWORD")
+              step(sb, "打开登录页")
+              if not on_login(sb):
+                  sb.cdp.open(f"{BASE}/auth/login?next={nxt}")
+                  time.sleep(4)
+              em = first_sel(sb, ['input[type="email"]', 'input[name="email"]', 'input[autocomplete="username"]', 'input[placeholder*="email" i]'])
+              pw = first_sel(sb, ['input[type="password"]'])
+              if not em or not pw:
+                  raise RuntimeError("登录页找不到邮箱/密码输入框")
+              sb.cdp.click(em); sb.cdp.press_keys(em, EMAIL)
+              sb.cdp.click(pw); sb.cdp.press_keys(pw, PASSWORD)
+              step(sb, "已填账号密码-点CF验证")
+              if not pass_turnstile(sb, "登录"):
+                  raise RuntimeError("登录页 CF 验证没通过")
+              step(sb, "登录页CF已打勾-点Sign in")
+              btn = first_sel(sb, ['button[type="submit"]', 'button:contains("Sign in")'], 5)
+              if not btn:
+                  raise RuntimeError("找不到 Sign in 按钮")
+              sb.cdp.click(btn)
+              for _ in range(30):
+                  time.sleep(1)
+                  if not on_login(sb):
+                      break
+              step(sb, "点击登录之后")
+              if on_login(sb):
+                  body = " ".join(body_text(sb).split())
+                  cur = sb.cdp.get_current_url()
+                  if re.search(r"device|verify-|/verify|2fa|otp", cur, re.I) or re.search(r"check your email|verification code|new device|two.factor|authenticator", body, re.I):
+                      raise RuntimeError(f"登录要求新设备/邮箱验证码或两步验证，脚本无法自动完成（{cur}）。页面：{body[:200]}")
+                  err = js(sb, """(()=>[...document.querySelectorAll('[role=alert],[class*=error],[class*=Error],[class*=alert]')]
+                      .map(e=>e.innerText.trim()).filter(Boolean).join(' | '))()""") or ""
+                  raise RuntimeError(f"登录没成功，停在 {sb.cdp.get_current_url()}。页面提示：{err or body[:200]}")
+              cur = sb.cdp.get_current_url()
+              body = " ".join(body_text(sb).split())
+              if re.search(r"device|/verify|2fa|otp", cur, re.I) or re.search(r"check your email|verification code|new device", body, re.I):
+                  raise RuntimeError(f"登录要求新设备/邮箱验证码，脚本无法自动完成（{cur}）。页面：{body[:200]}")
+              print("登录成功 →", cur)
+
+          def open_timer(sb, url, sid):
               sb.cdp.open(url)
               time.sleep(5)
-              cur = sb.cdp.get_current_url()
-              if "/login" in cur or "/auth" in cur:
-                  raise RuntimeError(f"被跳到登录页（{cur}），Cookie 已失效，请重新复制 FALIX_COOKIE")
+              if on_login(sb):
+                  print("需要登录：", sb.cdp.get_current_url())
+                  login(sb, f"%2Ftimer%3Fid%3D{sid}")
+                  if "/timer" not in sb.cdp.get_current_url():
+                      sb.cdp.open(url); time.sleep(5)
+                  if on_login(sb):
+                      raise RuntimeError(f"登录后又被跳回登录页：{sb.cdp.get_current_url()}")
 
           def save_new_cookie(sb):
               """登录状态正常时，把浏览器里最新的 cookie 存下来，供工作流回写到 Secret（令牌会轮换）"""
@@ -325,7 +387,7 @@ jobs:
 
           def renew_one(sb, sid):
               url = f"{BASE}/timer?id={sid}"
-              open_timer(sb, url)
+              open_timer(sb, url, sid)
               step(sb, "续期页已打开")
               save_new_cookie(sb)
               first_before, first_txt = read_timer(sb)
@@ -337,14 +399,14 @@ jobs:
                   if not pass_turnstile(sb, n):
                       notes.append(f"第{n}轮：CF 验证没通过")
                       step(sb, f"第{n}轮-CF未通过-重新打开页面")
-                      open_timer(sb, url)
+                      open_timer(sb, url, sid)
                       continue
                   step(sb, f"第{n}轮-CF已打勾-点AddTime")
                   try:
                       sb.cdp.click('button:contains("Add time")', timeout=15)
                   except Exception as e:
                       notes.append(f"第{n}轮：找不到或点不了 Add time 按钮（{e.__class__.__name__}）")
-                      open_timer(sb, url)
+                      open_timer(sb, url, sid)
                       continue
                   time.sleep(4)
                   t = toast_text(sb)
@@ -362,8 +424,8 @@ jobs:
               raise RuntimeError(f"续期前 {first_txt}；" + "；".join(notes))
 
           def main():
-              if not COOKIE:
-                  tg("❌ Falix 续期：没有配置 FALIX_COOKIE"); raise SystemExit(1)
+              if not COOKIE and not (EMAIL and PASSWORD):
+                  tg("❌ Falix 续期：请配置 FALIX_EMAIL 和 FALIX_PASSWORD"); raise SystemExit(1)
               if not IDS:
                   tg("❌ Falix 续期：没有配置 FALIX_SERVER_ID"); raise SystemExit(1)
               now = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
@@ -379,14 +441,9 @@ jobs:
                       step(sb, "浏览器已启动")
                       cks = [mycdp.network.CookieParam(name=k, value=v, url=BASE + "/", path="/", secure=True)
                              for k, v in parse_cookies(COOKIE)]
-                      names = [c.name for c in cks]
-                      if not names:
-                          raise RuntimeError("FALIX_COOKIE 里没解析出任何 名字=值。要粘贴整串 Cookie（如 falix_at=...; falix_rt=...），不能只贴值")
-                      miss = [k for k in ("falix_at", "falix_rt", "falix_did") if k not in names]
-                      if miss:
-                          print("⚠️ FALIX_COOKIE 缺少:", ", ".join(miss))
-                      sb.cdp.set_all_cookies(cks)
-                      print(f"已写入 {len(names)} 个 cookie:", ", ".join(names))
+                      if cks:
+                          sb.cdp.set_all_cookies(cks)
+                          print(f"已写入 {len(cks)} 个 cookie（失效会自动改用账号密码登录）")
                       for sid in IDS:
                           try:
                               b_txt, b, a_txt, a, n = renew_one(sb, sid)
