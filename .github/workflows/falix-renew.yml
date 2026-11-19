@@ -239,6 +239,7 @@ jobs:
 
           def parse_cookies(s):
               out = []
+              s = re.sub(r"^\s*cookie\s*:\s*", "", s.strip(), flags=re.I)
               for part in s.replace("\n", ";").split(";"):
                   if "=" not in part:
                       continue
@@ -309,10 +310,24 @@ jobs:
               if "/login" in cur or "/auth" in cur:
                   raise RuntimeError(f"被跳到登录页（{cur}），Cookie 已失效，请重新复制 FALIX_COOKIE")
 
+          def save_new_cookie(sb):
+              """登录状态正常时，把浏览器里最新的 cookie 存下来，供工作流回写到 Secret（令牌会轮换）"""
+              try:
+                  cs = sb.cdp.get_all_cookies()
+                  pairs = [f"{c.name}={c.value}" for c in cs
+                           if "falixnodes" in (c.domain or "") and not SKIP.match(c.name)]
+                  if any(p.startswith("falix_rt=") for p in pairs):
+                      with open("new_cookie.txt", "w") as f:
+                          f.write("; ".join(pairs))
+                      print(f"已保存最新 cookie（{len(pairs)} 个）")
+              except Exception as e:
+                  print("保存新 cookie 失败:", e)
+
           def renew_one(sb, sid):
               url = f"{BASE}/timer?id={sid}"
               open_timer(sb, url)
               step(sb, "续期页已打开")
+              save_new_cookie(sb)
               first_before, first_txt = read_timer(sb)
               print(f"[{sid}] 续期前: {first_txt}")
               notes = []
@@ -364,8 +379,14 @@ jobs:
                       step(sb, "浏览器已启动")
                       cks = [mycdp.network.CookieParam(name=k, value=v, url=BASE + "/", path="/", secure=True)
                              for k, v in parse_cookies(COOKIE)]
+                      names = [c.name for c in cks]
+                      if not names:
+                          raise RuntimeError("FALIX_COOKIE 里没解析出任何 名字=值。要粘贴整串 Cookie（如 falix_at=...; falix_rt=...），不能只贴值")
+                      miss = [k for k in ("falix_at", "falix_rt", "falix_did") if k not in names]
+                      if miss:
+                          print("⚠️ FALIX_COOKIE 缺少:", ", ".join(miss))
                       sb.cdp.set_all_cookies(cks)
-                      print("已写入 cookie:", ", ".join(c.name for c in cks))
+                      print(f"已写入 {len(names)} 个 cookie:", ", ".join(names))
                       for sid in IDS:
                           try:
                               b_txt, b, a_txt, a, n = renew_one(sb, sid)
@@ -377,7 +398,7 @@ jobs:
                               lines += [f"❌ 服务器 {sid} 续期失败", f"卡在步骤：{STEP['name']}", str(e)[:600]]
               except Exception as e:
                   failed = True
-                  lines += ["❌ 浏览器异常退出", f"卡在步骤：{STEP['name']}", f"{e.__class__.__name__}: {str(e)[:400]}"]
+                  lines += ["❌ 运行出错", f"卡在步骤：{STEP['name']}", f"{e.__class__.__name__}: {str(e)[:400]}"]
               msg = "\n".join(lines)
               tg(msg)
               if failed:
@@ -388,6 +409,16 @@ jobs:
               main()
           PY
           python renew.py
+
+      - name: 回写最新 Cookie（可选，需要 Secret GH_PAT）
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "没配置 GH_PAT，跳过回写"; exit 0; fi
+          if [ ! -s new_cookie.txt ]; then echo "没有新 cookie，跳过"; exit 0; fi
+          gh secret set FALIX_COOKIE --repo "$GITHUB_REPOSITORY" < new_cookie.txt && echo "FALIX_COOKIE 已更新"
+          rm -f new_cookie.txt
 
       - name: 上传截图
         if: always()
