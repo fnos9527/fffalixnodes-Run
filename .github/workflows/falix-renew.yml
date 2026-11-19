@@ -171,7 +171,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq xvfb python3-tk scrot > /dev/null
-          pip install -q seleniumbase requests pyautogui
+          pip install -q "seleniumbase==4.58.1" requests pyautogui
 
       - name: 续期
         env:
@@ -180,8 +180,10 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           cat > renew.py <<'PY'
-          # Falix 服务器续期：Cookie 登录 → 读剩余时间 → 过 CF 验证 → Add time → 刷新再读 → TG 通知
-          import os, re, time, datetime, requests
+          # Falix 服务器续期（SeleniumBase CDP 模式）：Cookie 登录 → 读剩余时间 → 过 CF 验证 → Add time → 刷新再读 → TG 通知
+          # 每一步都会截图到 shots/，失败时把最后一张截图直接发到 TG
+          import os, re, time, glob, datetime, requests
+          import mycdp
           from seleniumbase import SB
 
           BASE = "https://client.falixnodes.net"
@@ -192,7 +194,9 @@ jobs:
           PROXY_NOTE = os.environ.get("PROXY_NOTE", "")
           TG_TOKEN, TG_CHAT = os.environ.get("TG_BOT_TOKEN", ""), os.environ.get("TG_CHAT_ID", "")
           MAX_TRY = 3
-          SKIP = re.compile(r"^(cf_clearance|__cf_bm|__cflb|_cfuvid)$")  # 这些和 IP/浏览器绑定，带上反而会被拦
+          SKIP = re.compile(r"^(cf_clearance|__cf_bm|__cflb|_cfuvid)$")  # 和 IP/浏览器绑定，带上反而会被拦
+          SHOT_DIR = "shots"
+          STEP = {"name": "启动浏览器", "n": 0}
 
           def tg(text):
               print(text)
@@ -202,6 +206,36 @@ jobs:
                                     json={"chat_id": TG_CHAT, "text": text}, timeout=20)
                   except Exception as e:
                       print("TG 发送失败:", e)
+
+          def tg_photo(path, caption):
+              if TG_TOKEN and TG_CHAT and path and os.path.exists(path):
+                  try:
+                      with open(path, "rb") as f:
+                          requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+                                        data={"chat_id": TG_CHAT, "caption": caption[:1000]}, files={"photo": f}, timeout=60)
+                  except Exception as e:
+                      print("TG 发图失败:", e)
+
+          def step(sb, name):
+              """进入新步骤：打印日志 + 截图"""
+              STEP["n"] += 1
+              STEP["name"] = name
+              print(f"==> 步骤{STEP['n']}: {name}", flush=True)
+              shot(sb, name)
+
+          def shot(sb, name):
+              os.makedirs(SHOT_DIR, exist_ok=True)
+              fn = f"{STEP['n']:02d}-{re.sub(r'[^0-9A-Za-z_一-龥-]+', '_', name)}.png"
+              try:
+                  sb.cdp.save_screenshot(fn, folder=SHOT_DIR)
+                  return os.path.join(SHOT_DIR, fn)
+              except Exception as e:
+                  print("截图失败:", e)
+                  return None
+
+          def last_shot():
+              files = sorted(glob.glob(f"{SHOT_DIR}/*.png"))
+              return files[-1] if files else None
 
           def parse_cookies(s):
               out = []
@@ -218,35 +252,42 @@ jobs:
           TIMER_RE = re.compile(r"((?:\d+\s*(?:days?|hours?|minutes?|seconds?)[\s,]*)+)", re.I)
 
           def to_sec(txt):
-              return sum(int(n) * UNITS[u.lower().rstrip("s")] for n, u in re.findall(r"(\d+)\s*(day|hour|minute|second)s?", txt, re.I))
+              return sum(int(n) * UNITS[u.lower()] for n, u in re.findall(r"(\d+)\s*(day|hour|minute|second)s?", txt, re.I))
 
           def fmt(sec):
               sign = "-" if sec < 0 else ""
               sec = abs(int(sec)); h, r = divmod(sec, 3600); m, s = divmod(r, 60)
               return f"{sign}{h}小时{m}分{s}秒"
 
+          def js(sb, expr):
+              return sb.cdp.evaluate(expr)
+
+          def body_text(sb):
+              return js(sb, "document.body ? document.body.innerText : ''") or ""
+
           def read_timer(sb, wait=40):
               for _ in range(wait):
-                  body = sb.execute_script("return document.body ? document.body.innerText : ''")
-                  # 优先取 “SERVER TIMER” 标签后面的那段
-                  i = body.upper().find("SERVER TIMER\n")
+                  body = body_text(sb)
+                  i = body.upper().find("SERVER TIMER")
                   seg = body[i:i + 300] if i >= 0 else body
                   m = TIMER_RE.search(seg) or TIMER_RE.search(body)
                   if m and to_sec(m.group(1)) > 0:
                       return to_sec(m.group(1)), " ".join(m.group(1).split())
                   time.sleep(1)
-              raise RuntimeError("没读到剩余时间（页面没加载出来或 Cookie 失效）")
+              url = sb.cdp.get_current_url()
+              head = " ".join(body_text(sb).split())[:150]
+              raise RuntimeError(f"没读到剩余时间。当前网址：{url}；页面开头：{head}")
 
           def turnstile_ok(sb):
-              return sb.execute_script(
-                  "const e=document.querySelector('[name=\"cf-turnstile-response\"]');return !!(e&&e.value&&e.value.length>10)")
+              return bool(js(sb, "(()=>{const e=document.querySelector('[name=\"cf-turnstile-response\"]');"
+                                 "return !!(e&&e.value&&e.value.length>10)})()"))
 
-          def pass_turnstile(sb):
-              for i in range(4):
+          def pass_turnstile(sb, n):
+              for i in range(1, 5):
                   if turnstile_ok(sb):
                       return True
                   try:
-                      sb.uc_gui_click_captcha()      # 用真实鼠标点 CF 框
+                      sb.cdp.gui_click_captcha()      # 用真实鼠标点 CF 框
                   except Exception as e:
                       print("点击验证框异常:", e)
                   for _ in range(10):
@@ -254,49 +295,55 @@ jobs:
                           print("CF 验证已打勾")
                           return True
                       time.sleep(1)
+                  shot(sb, f"第{n}轮-CF第{i}次点击后仍未通过")
               return False
 
           def toast_text(sb):
-              return sb.execute_script("""
-                return [...document.querySelectorAll('[role=alert],[role=status],.toast,[class*=toast],[class*=Toast],[class*=notif],[class*=alert]')]
-                  .map(e=>e.innerText.trim()).filter(t=>t && t.length<200).join(' | ')""") or ""
+              return js(sb, """(()=>[...document.querySelectorAll('[role=alert],[role=status],.toast,[class*=toast],[class*=Toast],[class*=notif],[class*=alert]')]
+                  .map(e=>e.innerText.trim()).filter(t=>t && t.length<200).join(' | '))()""") or ""
 
-          def shot(sb, name):
-              try:
-                  os.makedirs("shots", exist_ok=True); sb.save_screenshot(f"shots/{name}.png")
-              except Exception:
-                  pass
+          def open_timer(sb, url):
+              sb.cdp.open(url)
+              time.sleep(5)
+              cur = sb.cdp.get_current_url()
+              if "/login" in cur or "/auth" in cur:
+                  raise RuntimeError(f"被跳到登录页（{cur}），Cookie 已失效，请重新复制 FALIX_COOKIE")
 
           def renew_one(sb, sid):
               url = f"{BASE}/timer?id={sid}"
-              sb.uc_open_with_reconnect(url, 5)
-              time.sleep(3)
-              if "/login" in sb.get_current_url() or "/auth" in sb.get_current_url():
-                  raise RuntimeError("被跳到登录页，Cookie 已失效，请重新复制 FALIX_COOKIE")
+              open_timer(sb, url)
+              step(sb, "续期页已打开")
               first_before, first_txt = read_timer(sb)
               print(f"[{sid}] 续期前: {first_txt}")
               notes = []
               for n in range(1, MAX_TRY + 1):
                   before, _ = read_timer(sb)
-                  if not pass_turnstile(sb):
-                      notes.append(f"第{n}次：CF 验证没通过")
-                      shot(sb, f"{sid}-cf-{n}")
-                      sb.uc_open_with_reconnect(url, 5); time.sleep(3)
+                  step(sb, f"第{n}轮-点CF验证")
+                  if not pass_turnstile(sb, n):
+                      notes.append(f"第{n}轮：CF 验证没通过")
+                      step(sb, f"第{n}轮-CF未通过-重新打开页面")
+                      open_timer(sb, url)
                       continue
-                  btn = "//button[contains(normalize-space(.), 'Add time')]"
-                  sb.wait_for_element_visible(btn, by="xpath", timeout=15)
-                  sb.click(btn, by="xpath")
+                  step(sb, f"第{n}轮-CF已打勾-点AddTime")
+                  try:
+                      sb.cdp.click('button:contains("Add time")', timeout=15)
+                  except Exception as e:
+                      notes.append(f"第{n}轮：找不到或点不了 Add time 按钮（{e.__class__.__name__}）")
+                      open_timer(sb, url)
+                      continue
                   time.sleep(4)
                   t = toast_text(sb)
+                  step(sb, f"第{n}轮-点击AddTime之后")
                   if t:
                       print(f"[{sid}] 点击后提示: {t}")
-                  sb.refresh(); time.sleep(4)
+                  sb.cdp.reload()
+                  time.sleep(5)
                   after, after_txt = read_timer(sb)
-                  print(f"[{sid}] 第{n}次 续期后: {after_txt}")
+                  step(sb, f"第{n}轮-刷新后")
+                  print(f"[{sid}] 第{n}轮 续期后: {after_txt}")
                   if after > before:
-                      return first_txt, first_before, after_txt, after, n, t
-                  notes.append(f"第{n}次：时间没增加" + (f"（页面提示：{t}）" if t else ""))
-                  shot(sb, f"{sid}-noinc-{n}")
+                      return first_txt, first_before, after_txt, after, n
+                  notes.append(f"第{n}轮：时间没增加" + (f"（页面提示：{t}）" if t else ""))
               raise RuntimeError(f"续期前 {first_txt}；" + "；".join(notes))
 
           def main():
@@ -306,28 +353,35 @@ jobs:
                   tg("❌ Falix 续期：没有配置 FALIX_SERVER_ID"); raise SystemExit(1)
               now = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
               net = ("代理 " + PROXY) if IS_PROXY else "直连"
-              lines, failed = [f"Falix 续期  {now}（北京时间）", f"网络：{net}" + (f"（{PROXY_NOTE}）" if PROXY_NOTE else "")], False
+              lines = [f"Falix 续期  {now}（北京时间）", f"网络：{net}" + (f"（{PROXY_NOTE}）" if PROXY_NOTE else "")]
+              failed = False
               kw = dict(uc=True, xvfb=True, locale="en", window_size="1280,900")
               if IS_PROXY:
                   kw["proxy"] = PROXY
-              with SB(**kw) as sb:
-                  sb.uc_open_with_reconnect(BASE + "/", 5)
-                  for k, v in parse_cookies(COOKIE):
-                      try:
-                          sb.driver.add_cookie({"name": k, "value": v, "domain": "client.falixnodes.net", "path": "/", "secure": True})
-                      except Exception as e:
-                          print("写入 cookie 失败", k, e)
-                  for sid in IDS:
-                      try:
-                          b_txt, b, a_txt, a, n, t = renew_one(sb, sid)
-                          lines += [f"✅ 服务器 {sid} 续期成功（第{n}次）",
-                                    f"续期前：{b_txt}", f"续期后：{a_txt}", f"增加：{fmt(a - b)}"]
-                      except Exception as e:
-                          failed = True
-                          shot(sb, f"{sid}-error")
-                          lines += [f"❌ 服务器 {sid} 续期失败", str(e)]
-              tg("\n".join(lines))
+              try:
+                  with SB(**kw) as sb:
+                      sb.activate_cdp_mode("about:blank")
+                      step(sb, "浏览器已启动")
+                      cks = [mycdp.network.CookieParam(name=k, value=v, url=BASE + "/", path="/", secure=True)
+                             for k, v in parse_cookies(COOKIE)]
+                      sb.cdp.set_all_cookies(cks)
+                      print("已写入 cookie:", ", ".join(c.name for c in cks))
+                      for sid in IDS:
+                          try:
+                              b_txt, b, a_txt, a, n = renew_one(sb, sid)
+                              lines += [f"✅ 服务器 {sid} 续期成功（第{n}轮）",
+                                        f"续期前：{b_txt}", f"续期后：{a_txt}", f"增加：{fmt(a - b)}"]
+                          except Exception as e:
+                              failed = True
+                              shot(sb, f"失败-{STEP['name']}")
+                              lines += [f"❌ 服务器 {sid} 续期失败", f"卡在步骤：{STEP['name']}", str(e)[:600]]
+              except Exception as e:
+                  failed = True
+                  lines += ["❌ 浏览器异常退出", f"卡在步骤：{STEP['name']}", f"{e.__class__.__name__}: {str(e)[:400]}"]
+              msg = "\n".join(lines)
+              tg(msg)
               if failed:
+                  tg_photo(last_shot(), f"失败截图：{STEP['name']}")
                   raise SystemExit(1)
 
           if __name__ == "__main__":
@@ -336,10 +390,10 @@ jobs:
           python renew.py
 
       - name: 上传截图
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: error-screenshot
+          name: screenshots
           path: shots/
           if-no-files-found: ignore
           retention-days: 3
