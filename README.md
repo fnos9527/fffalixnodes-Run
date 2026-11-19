@@ -1,1 +1,10 @@
 # fffalixnodes-Run
+
+FALIX_COOKIE
+
+NODE_LINK
+
+TG_BOT_TOKEN
+
+TG_CHAT_ID
+
