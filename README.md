@@ -1,6 +1,8 @@
 # fffalixnodes-Run
 
-FALIX_COOKIE
+FALIX_EMAIL
+
+FALIX_PASSWORD
 
 NODE_LINK
 
