@@ -271,13 +271,15 @@ jobs:
               return js(sb, "document.body ? document.body.innerText : ''") or ""
 
           def read_timer(sb, wait=40):
+              """只在续期页 /timer 上、且只读 SERVER TIMER 那一块的数字，别的页面一律不认"""
               for _ in range(wait):
-                  body = body_text(sb)
-                  i = body.upper().find("SERVER TIMER")
-                  seg = body[i:i + 300] if i >= 0 else body
-                  m = TIMER_RE.search(seg) or TIMER_RE.search(body)
-                  if m and to_sec(m.group(1)) > 0:
-                      return to_sec(m.group(1)), " ".join(m.group(1).split())
+                  if "/timer" in (sb.cdp.get_current_url() or ""):
+                      body = body_text(sb)
+                      i = body.upper().find("SERVER TIMER")
+                      if i >= 0:
+                          m = TIMER_RE.search(body[i + len("SERVER TIMER"):i + 200])
+                          if m and to_sec(m.group(1)) > 0:
+                              return to_sec(m.group(1)), " ".join(m.group(1).split())
                   time.sleep(1)
               url = sb.cdp.get_current_url()
               head = " ".join(body_text(sb).split())[:150]
@@ -413,10 +415,11 @@ jobs:
                   step(sb, f"第{n}轮-点击AddTime之后")
                   if t:
                       print(f"[{sid}] 点击后提示: {t}")
-                  sb.cdp.reload()
-                  time.sleep(5)
+                  # 点完会跳到首页，必须重新打开续期页再读剩余时间
+                  print(f"[{sid}] 点击后当前网址: {sb.cdp.get_current_url()}，重新打开续期页")
+                  open_timer(sb, url, sid)
                   after, after_txt = read_timer(sb)
-                  step(sb, f"第{n}轮-刷新后")
+                  step(sb, f"第{n}轮-重新打开续期页")
                   print(f"[{sid}] 第{n}轮 续期后: {after_txt}")
                   if after > before:
                       return first_txt, first_before, after_txt, after, n
