@@ -1,0 +1,352 @@
+name: Falix 服务器续期
+
+on:
+  schedule:
+    - cron: "0 2 * * *"      # 每天北京时间 10:00（GitHub 定时常会晚几分钟到几十分钟）
+  workflow_dispatch:
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SOCKS_PORT: "1080"
+      FALIX_SERVER_ID: ${{ vars.FALIX_SERVER_ID || '3530628' }}   # 多台用英文逗号隔开
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup optional VLESS node
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$NODE_LINK" ]; then
+            echo "未配置 NODE_LINK，全程直连"
+            echo "IS_PROXY=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/sb" && cd "$RUNNER_TEMP/sb"
+          cat > vless2sb.py <<'PY'
+          # 把 VLESS 链接转换成 sing-box 配置：本地 socks5 127.0.0.1:${SOCKS_PORT:-1080}
+          import os, sys, json, base64, re
+          from urllib.parse import urlsplit, parse_qs, unquote
+
+          def pick_link(raw):
+              raw = raw.strip().strip('"').strip("'")
+              if not raw.lower().startswith("vless://"):
+                  # 兼容整段 base64（订阅内容 / 编码过的链接）
+                  try:
+                      dec = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore")
+                      if "vless://" in dec:
+                          raw = dec
+                  except Exception:
+                      pass
+              m = re.search(r"vless://\S+", raw)  # 多行时取第一条 vless
+              if not m:
+                  sys.exit("NODE_LINK 不是 vless:// 链接")
+              return m.group(0)
+
+          def first(q, *keys, default=""):
+              for k in keys:
+                  if q.get(k) and q[k][0] != "":
+                      return unquote(q[k][0])
+              return default
+
+          def build(link, port):
+              u = urlsplit(link)
+              if "@" not in u.netloc:
+                  sys.exit("链接缺少 uuid@host")
+              uuid = unquote(u.netloc.rsplit("@", 1)[0])
+              host = u.hostname
+              sport = u.port or 443
+              q = parse_qs(u.query, keep_blank_values=True)
+              net = first(q, "type", "net", default="tcp").lower()
+              sec = first(q, "security", default="none").lower()
+              sni = first(q, "sni", "peer", "serverName")
+              hhost = first(q, "host")
+              path = first(q, "path", default="/")
+              fp = first(q, "fp", "fingerprint")
+              alpn = [a for a in first(q, "alpn").split(",") if a]
+              flow = first(q, "flow")
+              insecure = first(q, "allowInsecure", "insecure", "allow_insecure") in ("1", "true", "True")
+
+              ob = {"type": "vless", "tag": "proxy", "server": host, "server_port": sport, "uuid": uuid}
+              if flow:
+                  ob["flow"] = flow
+              enc = first(q, "packetEncoding", "packet_encoding")
+              if enc:
+                  ob["packet_encoding"] = enc
+
+              # ---- 传输层 ----
+              if net in ("ws", "websocket"):
+                  t = {"type": "ws", "path": path}
+                  m = re.search(r"[?&]ed=(\d+)", path)  # /path?ed=2048 早期数据
+                  if m:
+                      t["path"] = re.sub(r"[?&]ed=\d+", "", path) or "/"
+                      t["max_early_data"] = int(m.group(1))
+                      t["early_data_header_name"] = "Sec-WebSocket-Protocol"
+                  if hhost:
+                      t["headers"] = {"Host": hhost}
+                  ob["transport"] = t
+              elif net == "grpc":
+                  ob["transport"] = {"type": "grpc", "service_name": first(q, "serviceName", "service_name", "path", default="")}
+              elif net in ("http", "h2"):
+                  t = {"type": "http", "path": path}
+                  if hhost:
+                      t["host"] = [h for h in hhost.split(",") if h]
+                  ob["transport"] = t
+              elif net in ("httpupgrade",):
+                  t = {"type": "httpupgrade", "path": path}
+                  if hhost:
+                      t["host"] = hhost
+                  ob["transport"] = t
+              elif net in ("tcp", "raw", ""):
+                  if first(q, "headerType") == "http":
+                      sys.exit("sing-box 不支持 tcp + headerType=http 伪装（Xray 专有），请换 ws/grpc/reality 节点")
+              elif net in ("quic",):
+                  ob["transport"] = {"type": "quic"}
+              else:
+                  sys.exit(f"sing-box 不支持传输类型 {net}（如 xhttp/splithttp/kcp）")
+
+              # ---- 加密层 ----
+              if sec in ("tls", "xtls", "reality"):
+                  tls = {"enabled": True, "server_name": sni or hhost or host, "insecure": insecure}
+                  if alpn:
+                      tls["alpn"] = alpn
+                  if fp or sec == "reality":
+                      tls["utls"] = {"enabled": True, "fingerprint": fp or "chrome"}
+                  if sec == "reality":
+                      tls["reality"] = {"enabled": True, "public_key": first(q, "pbk", "publicKey"),
+                                        "short_id": first(q, "sid", "shortId")}
+                  ob["tls"] = tls
+
+              return {
+                  "log": {"level": "warn", "timestamp": True},
+                  "inbounds": [{"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": port}],
+                  "outbounds": [ob],
+              }
+
+          if __name__ == "__main__":
+              port = int(os.environ.get("SOCKS_PORT", "1080"))
+              cfg = build(pick_link(os.environ["NODE_LINK"]), port)
+              out = sys.argv[1] if len(sys.argv) > 1 else "sb.json"
+              json.dump(cfg, open(out, "w"), indent=2, ensure_ascii=False)
+              o = cfg["outbounds"][0]
+              print(f"节点: {o['server']}:{o['server_port']}  传输: {o.get('transport', {}).get('type', 'tcp')}  "
+                    f"TLS: {'reality' if o.get('tls', {}).get('reality') else ('tls' if o.get('tls') else 'none')}")
+          PY
+          if ! python vless2sb.py sb.json; then
+            echo "IS_PROXY=false" >> "$GITHUB_ENV"
+            echo "PROXY_NOTE=节点链接无法解析，已改直连" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/SagerNet/sing-box/releases/latest | python -c "import sys,json;print(json.load(sys.stdin)['tag_name'])" || echo v1.12.12)
+          VER=${TAG#v}
+          echo "sing-box $TAG"
+          curl -fsSL -o sb.tgz "https://github.com/SagerNet/sing-box/releases/download/$TAG/sing-box-$VER-linux-amd64.tar.gz"
+          tar -xzf sb.tgz --strip-components=1
+          ./sing-box check -c sb.json
+          nohup ./sing-box run -c sb.json > sb.log 2>&1 &
+          echo $! > sb.pid
+          OK=false
+          for i in $(seq 1 15); do
+            sleep 1
+            if IP=$(curl -fsS -m 8 --socks5-hostname 127.0.0.1:$SOCKS_PORT https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2); then
+              [ -n "$IP" ] && OK=true && break
+            fi
+          done
+          if $OK; then
+            echo "代理可用，出口 IP: $IP"
+            echo "IS_PROXY=true" >> "$GITHUB_ENV"
+            echo "PROXY_URL=socks5://127.0.0.1:$SOCKS_PORT" >> "$GITHUB_ENV"
+          else
+            echo "代理连不通，改直连"; cat sb.log
+            echo "IS_PROXY=false" >> "$GITHUB_ENV"
+            echo "PROXY_NOTE=节点连不通，已改直连" >> "$GITHUB_ENV"
+          fi
+
+      - name: 安装浏览器环境
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb python3-tk scrot > /dev/null
+          pip install -q seleniumbase requests pyautogui
+
+      - name: 续期
+        env:
+          FALIX_COOKIE: ${{ secrets.FALIX_COOKIE }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          cat > renew.py <<'PY'
+          # Falix 服务器续期：Cookie 登录 → 读剩余时间 → 过 CF 验证 → Add time → 刷新再读 → TG 通知
+          import os, re, time, datetime, requests
+          from seleniumbase import SB
+
+          BASE = "https://client.falixnodes.net"
+          IDS = [s.strip() for s in os.environ.get("FALIX_SERVER_ID", "").split(",") if s.strip()]
+          COOKIE = os.environ.get("FALIX_COOKIE", "")
+          IS_PROXY = os.environ.get("IS_PROXY", "false") == "true"
+          PROXY = os.environ.get("PROXY_URL", "socks5://127.0.0.1:1080")
+          PROXY_NOTE = os.environ.get("PROXY_NOTE", "")
+          TG_TOKEN, TG_CHAT = os.environ.get("TG_BOT_TOKEN", ""), os.environ.get("TG_CHAT_ID", "")
+          MAX_TRY = 3
+          SKIP = re.compile(r"^(cf_clearance|__cf_bm|__cflb|_cfuvid)$")  # 这些和 IP/浏览器绑定，带上反而会被拦
+
+          def tg(text):
+              print(text)
+              if TG_TOKEN and TG_CHAT:
+                  try:
+                      requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                                    json={"chat_id": TG_CHAT, "text": text}, timeout=20)
+                  except Exception as e:
+                      print("TG 发送失败:", e)
+
+          def parse_cookies(s):
+              out = []
+              for part in s.replace("\n", ";").split(";"):
+                  if "=" not in part:
+                      continue
+                  k, v = part.split("=", 1)
+                  k, v = k.strip(), v.strip()
+                  if k and not SKIP.match(k):
+                      out.append((k, v))
+              return out
+
+          UNITS = {"day": 86400, "hour": 3600, "minute": 60, "second": 1}
+          TIMER_RE = re.compile(r"((?:\d+\s*(?:days?|hours?|minutes?|seconds?)[\s,]*)+)", re.I)
+
+          def to_sec(txt):
+              return sum(int(n) * UNITS[u.lower().rstrip("s")] for n, u in re.findall(r"(\d+)\s*(day|hour|minute|second)s?", txt, re.I))
+
+          def fmt(sec):
+              sign = "-" if sec < 0 else ""
+              sec = abs(int(sec)); h, r = divmod(sec, 3600); m, s = divmod(r, 60)
+              return f"{sign}{h}小时{m}分{s}秒"
+
+          def read_timer(sb, wait=40):
+              for _ in range(wait):
+                  body = sb.execute_script("return document.body ? document.body.innerText : ''")
+                  # 优先取 “SERVER TIMER” 标签后面的那段
+                  i = body.upper().find("SERVER TIMER\n")
+                  seg = body[i:i + 300] if i >= 0 else body
+                  m = TIMER_RE.search(seg) or TIMER_RE.search(body)
+                  if m and to_sec(m.group(1)) > 0:
+                      return to_sec(m.group(1)), " ".join(m.group(1).split())
+                  time.sleep(1)
+              raise RuntimeError("没读到剩余时间（页面没加载出来或 Cookie 失效）")
+
+          def turnstile_ok(sb):
+              return sb.execute_script(
+                  "const e=document.querySelector('[name=\"cf-turnstile-response\"]');return !!(e&&e.value&&e.value.length>10)")
+
+          def pass_turnstile(sb):
+              for i in range(4):
+                  if turnstile_ok(sb):
+                      return True
+                  try:
+                      sb.uc_gui_click_captcha()      # 用真实鼠标点 CF 框
+                  except Exception as e:
+                      print("点击验证框异常:", e)
+                  for _ in range(10):
+                      if turnstile_ok(sb):
+                          print("CF 验证已打勾")
+                          return True
+                      time.sleep(1)
+              return False
+
+          def toast_text(sb):
+              return sb.execute_script("""
+                return [...document.querySelectorAll('[role=alert],[role=status],.toast,[class*=toast],[class*=Toast],[class*=notif],[class*=alert]')]
+                  .map(e=>e.innerText.trim()).filter(t=>t && t.length<200).join(' | ')""") or ""
+
+          def shot(sb, name):
+              try:
+                  os.makedirs("shots", exist_ok=True); sb.save_screenshot(f"shots/{name}.png")
+              except Exception:
+                  pass
+
+          def renew_one(sb, sid):
+              url = f"{BASE}/timer?id={sid}"
+              sb.uc_open_with_reconnect(url, 5)
+              time.sleep(3)
+              if "/login" in sb.get_current_url() or "/auth" in sb.get_current_url():
+                  raise RuntimeError("被跳到登录页，Cookie 已失效，请重新复制 FALIX_COOKIE")
+              first_before, first_txt = read_timer(sb)
+              print(f"[{sid}] 续期前: {first_txt}")
+              notes = []
+              for n in range(1, MAX_TRY + 1):
+                  before, _ = read_timer(sb)
+                  if not pass_turnstile(sb):
+                      notes.append(f"第{n}次：CF 验证没通过")
+                      shot(sb, f"{sid}-cf-{n}")
+                      sb.uc_open_with_reconnect(url, 5); time.sleep(3)
+                      continue
+                  btn = "//button[contains(normalize-space(.), 'Add time')]"
+                  sb.wait_for_element_visible(btn, by="xpath", timeout=15)
+                  sb.click(btn, by="xpath")
+                  time.sleep(4)
+                  t = toast_text(sb)
+                  if t:
+                      print(f"[{sid}] 点击后提示: {t}")
+                  sb.refresh(); time.sleep(4)
+                  after, after_txt = read_timer(sb)
+                  print(f"[{sid}] 第{n}次 续期后: {after_txt}")
+                  if after > before:
+                      return first_txt, first_before, after_txt, after, n, t
+                  notes.append(f"第{n}次：时间没增加" + (f"（页面提示：{t}）" if t else ""))
+                  shot(sb, f"{sid}-noinc-{n}")
+              raise RuntimeError(f"续期前 {first_txt}；" + "；".join(notes))
+
+          def main():
+              if not COOKIE:
+                  tg("❌ Falix 续期：没有配置 FALIX_COOKIE"); raise SystemExit(1)
+              if not IDS:
+                  tg("❌ Falix 续期：没有配置 FALIX_SERVER_ID"); raise SystemExit(1)
+              now = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+              net = ("代理 " + PROXY) if IS_PROXY else "直连"
+              lines, failed = [f"Falix 续期  {now}（北京时间）", f"网络：{net}" + (f"（{PROXY_NOTE}）" if PROXY_NOTE else "")], False
+              kw = dict(uc=True, xvfb=True, locale="en", window_size="1280,900")
+              if IS_PROXY:
+                  kw["proxy"] = PROXY
+              with SB(**kw) as sb:
+                  sb.uc_open_with_reconnect(BASE + "/", 5)
+                  for k, v in parse_cookies(COOKIE):
+                      try:
+                          sb.driver.add_cookie({"name": k, "value": v, "domain": "client.falixnodes.net", "path": "/", "secure": True})
+                      except Exception as e:
+                          print("写入 cookie 失败", k, e)
+                  for sid in IDS:
+                      try:
+                          b_txt, b, a_txt, a, n, t = renew_one(sb, sid)
+                          lines += [f"✅ 服务器 {sid} 续期成功（第{n}次）",
+                                    f"续期前：{b_txt}", f"续期后：{a_txt}", f"增加：{fmt(a - b)}"]
+                      except Exception as e:
+                          failed = True
+                          shot(sb, f"{sid}-error")
+                          lines += [f"❌ 服务器 {sid} 续期失败", str(e)]
+              tg("\n".join(lines))
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+          python renew.py
+
+      - name: 上传截图
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-screenshot
+          path: shots/
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Cleanup proxy
+        if: always()
+        run: |
+          pkill -9 -f "sing-box run" || true
+          rm -rf "$RUNNER_TEMP/sb"
+          echo "代理已清理"
